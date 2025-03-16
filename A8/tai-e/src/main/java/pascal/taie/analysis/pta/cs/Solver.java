@@ -32,36 +32,29 @@ import pascal.taie.analysis.pta.PointerAnalysisResult;
 import pascal.taie.analysis.pta.PointerAnalysisResultImpl;
 import pascal.taie.analysis.pta.core.cs.CSCallGraph;
 import pascal.taie.analysis.pta.core.cs.context.Context;
-import pascal.taie.analysis.pta.core.cs.element.ArrayIndex;
 import pascal.taie.analysis.pta.core.cs.element.CSCallSite;
 import pascal.taie.analysis.pta.core.cs.element.CSManager;
 import pascal.taie.analysis.pta.core.cs.element.CSMethod;
 import pascal.taie.analysis.pta.core.cs.element.CSObj;
 import pascal.taie.analysis.pta.core.cs.element.CSVar;
-import pascal.taie.analysis.pta.core.cs.element.InstanceField;
 import pascal.taie.analysis.pta.core.cs.element.MapBasedCSManager;
 import pascal.taie.analysis.pta.core.cs.element.Pointer;
 import pascal.taie.analysis.pta.core.cs.element.StaticField;
 import pascal.taie.analysis.pta.core.cs.selector.ContextSelector;
 import pascal.taie.analysis.pta.core.heap.HeapModel;
-import pascal.taie.analysis.pta.core.heap.Obj;
 import pascal.taie.analysis.pta.plugin.taint.TaintAnalysiss;
 import pascal.taie.analysis.pta.pts.PointsToSet;
 import pascal.taie.analysis.pta.pts.PointsToSetFactory;
 import pascal.taie.config.AnalysisOptions;
 import pascal.taie.ir.exp.InvokeExp;
+import pascal.taie.ir.exp.InvokeInstanceExp;
 import pascal.taie.ir.exp.Var;
-import pascal.taie.ir.stmt.Copy;
-import pascal.taie.ir.stmt.Invoke;
-import pascal.taie.ir.stmt.LoadArray;
-import pascal.taie.ir.stmt.LoadField;
-import pascal.taie.ir.stmt.New;
-import pascal.taie.ir.stmt.StmtVisitor;
-import pascal.taie.ir.stmt.StoreArray;
-import pascal.taie.ir.stmt.StoreField;
+import pascal.taie.ir.stmt.*;
 import pascal.taie.language.classes.JField;
 import pascal.taie.language.classes.JMethod;
 import pascal.taie.language.type.Type;
+
+import java.util.List;
 
 public class Solver {
 
@@ -110,6 +103,10 @@ public class Solver {
         taintAnalysis.onFinish();
     }
 
+    public void addTaintEntryToWorkList(Pointer pointer, CSObj taintObj) {
+        workList.addEntry(pointer, PointsToSetFactory.make(taintObj));
+    }
+
     private void initialize() {
         csManager = new MapBasedCSManager();
         callGraph = new CSCallGraph(csManager);
@@ -129,6 +126,11 @@ public class Solver {
      */
     private void addReachable(CSMethod csMethod) {
         // TODO - finish me
+        if (callGraph.addReachableMethod(csMethod)) {
+            for (Stmt stmt : csMethod.getMethod().getIR().getStmts()) {
+                stmt.accept(new StmtProcessor(csMethod, taintAnalysis));
+            }
+        }
     }
 
     /**
@@ -140,13 +142,93 @@ public class Solver {
 
         private final Context context;
 
-        private StmtProcessor(CSMethod csMethod) {
+        private final TaintAnalysiss analysis;
+
+        private StmtProcessor(CSMethod csMethod, TaintAnalysiss analysiss) {
             this.csMethod = csMethod;
             this.context = csMethod.getContext();
+            this.analysis = analysiss;
         }
 
         // TODO - if you choose to implement addReachable()
         //  via visitor pattern, then finish me
+
+        public Void visit(New stmt) {
+            CSVar varPtr = csManager.getCSVar(context,stmt.getLValue());
+            PointsToSet flowedInObjs = PointsToSetFactory.make(csManager.getCSObj(contextSelector.selectHeapContext(csMethod, heapModel.getObj(stmt)), heapModel.getObj(stmt)));
+            workList.addEntry(varPtr, flowedInObjs);
+            return null;
+        }
+
+        @Override
+        public Void visit(Copy stmt) {
+            Var LValue = stmt.getLValue();
+            Var RValue = stmt.getRValue();
+            CSVar sourcePtr = csManager.getCSVar(context, RValue);
+            CSVar targetPtr = csManager.getCSVar(context, LValue);
+            addPFGEdge(sourcePtr, targetPtr);
+            return null;
+        }
+
+        @Override
+        public Void visit(Invoke stmt) {
+            if(stmt.isStatic()){
+                JMethod callee = resolveCallee(null, stmt);
+                CSCallSite callSite = csManager.getCSCallSite(context, stmt);
+                Context ctx = contextSelector.selectContext(callSite, callee);
+                CSMethod targetMethod = csManager.getCSMethod(ctx, callee);
+
+                analysis.doTaintTransfer(callee, null, callSite);
+                if(callGraph.addEdge(new Edge<>(CallKind.STATIC, callSite, targetMethod))){
+                    addReachable(targetMethod);
+                    InvokeExp exp = stmt.getInvokeExp();
+                    if(exp != null){
+                        List<Var> args = exp.getArgs();
+                        for(int i = 0; i < args.size(); i++){
+                            CSVar argPtr = csManager.getCSVar(context, args.get(i));
+                            CSVar paramPtr = csManager.getCSVar(ctx, callee.getIR().getParams().get(i));
+                            addPFGEdge(argPtr, paramPtr);
+                        }
+                    }
+                    Var resultVar = stmt.getResult();
+                    if(resultVar != null){
+                        CSVar resultPtr = csManager.getCSVar(context, resultVar);
+                        for(Var returnVar : callee.getIR().getReturnVars()){
+                            CSVar returnPtr = csManager.getCSVar(ctx, returnVar);
+                            addPFGEdge(returnPtr, resultPtr);
+                        }
+                        if (taintAnalysis.captureTaintObj(targetMethod.getMethod(), callSite.getCallSite()) != null) {
+                            addTaintEntryToWorkList(resultPtr, taintAnalysis.captureTaintObj(targetMethod.getMethod(), callSite.getCallSite()));
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        @Override
+        public Void visit(LoadField stmt) {
+            JField sField = stmt.getFieldRef().resolve();
+            if (sField.isStatic()) {
+                StaticField sPtr = csManager.getStaticField(sField);
+                Var LValue = stmt.getLValue();
+                CSVar tPtr = csManager.getCSVar(context,LValue);
+                addPFGEdge(sPtr, tPtr);
+            }
+            return null;
+        }
+
+        @Override
+        public Void visit(StoreField stmt) {
+            JField sField = stmt.getFieldRef().resolve();
+            if (sField.isStatic()) {
+                StaticField sPtr = csManager.getStaticField(sField);
+                Var RValue = stmt.getRValue();
+                CSVar rPtr = csManager.getCSVar(context,RValue);
+                addPFGEdge(rPtr, sPtr);
+            }
+            return null;
+        }
     }
 
     /**
@@ -154,6 +236,12 @@ public class Solver {
      */
     private void addPFGEdge(Pointer source, Pointer target) {
         // TODO - finish me
+        if (pointerFlowGraph.addEdge(source, target)) {
+            PointsToSet setFromSource = source.getPointsToSet();
+            if (!setFromSource.isEmpty()) {
+                workList.addEntry(target, setFromSource);
+            }
+        }
     }
 
     /**
@@ -161,6 +249,30 @@ public class Solver {
      */
     private void analyze() {
         // TODO - finish me
+        while(!workList.isEmpty()){
+            WorkList.Entry entry = workList.pollEntry();
+            PointsToSet dta = propagate(entry.pointer(), entry.pointsToSet());
+
+            if (entry.pointer() instanceof CSVar csvar) {
+                Var var = csvar.getVar();
+                Context context = csvar.getContext();
+                dta.forEach(csobj->{
+                    var.getLoadFields().forEach(loadField->{
+                        addPFGEdge(csManager.getInstanceField(csobj, loadField.getFieldRef().resolve()), csManager.getCSVar(context, loadField.getLValue()));
+                    });
+                    var.getStoreFields().forEach(storeField->{
+                        addPFGEdge(csManager.getCSVar(context, storeField.getRValue()), csManager.getInstanceField(csobj, storeField.getFieldRef().resolve()));
+                    });
+                    var.getLoadArrays().forEach(loadArray->{
+                        addPFGEdge(csManager.getArrayIndex(csobj), csManager.getCSVar(context, loadArray.getLValue()));
+                    });
+                    var.getStoreArrays().forEach(storeArray->{
+                        addPFGEdge(csManager.getCSVar(context, storeArray.getRValue()), csManager.getArrayIndex(csobj));
+                    });
+                    processCall(csvar, csobj);
+                });
+            }
+        }
     }
 
     /**
@@ -169,7 +281,35 @@ public class Solver {
      */
     private PointsToSet propagate(Pointer pointer, PointsToSet pointsToSet) {
         // TODO - finish me
-        return null;
+        PointsToSet dta = PointsToSetFactory.make();
+        PointsToSet current = pointer.getPointsToSet();
+        if (!pointsToSet.isEmpty()) {
+            pointsToSet.forEach(csObj -> {
+                if (current.addObject(csObj)) {
+                    dta.addObject(csObj);
+                    if (taintAnalysis.isTaint(csObj) && pointer instanceof CSVar csVar) {
+                        for (Edge<CSCallSite, CSMethod> callEdge : callGraph.edges().toList()) {
+                            boolean taintFlowToArg = false;
+                            for (Var arg : callEdge.getCallSite().getCallSite().getInvokeExp().getArgs()) {
+                                CSVar csArg = csManager.getCSVar(callEdge.getCallSite().getContext(), arg);
+                                taintFlowToArg |= csArg.equals(csVar);
+                            }
+                            if (taintFlowToArg) {
+                                CSVar base = null;
+                                if (callEdge.getCallSite().getCallSite().getInvokeExp() instanceof InvokeInstanceExp instanceInvoke) {
+                                    base = csManager.getCSVar(callEdge.getCallSite().getContext(), instanceInvoke.getBase());
+                                }
+                                taintAnalysis.doTaintTransfer(callEdge.getCallee().getMethod(), base, callEdge.getCallSite());
+                            }
+                        }
+                    }
+                }
+            });
+            pointerFlowGraph.getSuccsOf(pointer).forEach(succ->{
+                workList.addEntry(succ, dta);
+            });
+        }
+        return dta;
     }
 
     /**
@@ -180,6 +320,48 @@ public class Solver {
      */
     private void processCall(CSVar recv, CSObj recvObj) {
         // TODO - finish me
+        Var var = recv.getVar();
+        Context context = recv.getContext();
+        for(Invoke invoke: var.getInvokes()){
+            JMethod callee = resolveCallee(recvObj, invoke);
+            CSCallSite callSite = csManager.getCSCallSite(context, invoke);
+            Context ctx = contextSelector.selectContext(callSite, recvObj, callee);
+            CSMethod targetMethod = csManager.getCSMethod(ctx, callee);
+            Context ctxrecv = callSite.getContext();
+            taintAnalysis.doTaintTransfer(callee, recv, callSite);
+            workList.addEntry(csManager.getCSVar(ctx, callee.getIR().getThis()), PointsToSetFactory.make(recvObj));
+            CallKind callKind;
+            if (invoke.isStatic()) { callKind = CallKind.STATIC; }
+            else if (invoke.isSpecial()) { callKind = CallKind.SPECIAL; }
+            else if (invoke.isInterface()) { callKind = CallKind.INTERFACE; }
+            else if (invoke.isVirtual()) { callKind = CallKind.VIRTUAL; }
+            else if (invoke.isDynamic()) { callKind = CallKind.DYNAMIC; }
+            else { callKind = CallKind.OTHER; }
+
+            if(callGraph.addEdge(new Edge<>(callKind, callSite, targetMethod))){
+                addReachable(targetMethod);
+                InvokeExp exp = invoke.getInvokeExp();
+                if(exp != null){
+                    List<Var> args = exp.getArgs();
+                    for(int i = 0; i < args.size(); i++){
+                        CSVar argPtr = csManager.getCSVar(ctxrecv, args.get(i));
+                        CSVar paramPtr = csManager.getCSVar(ctx, callee.getIR().getParams().get(i));
+                        addPFGEdge(argPtr, paramPtr);
+                    }
+                }
+                Var resultVar = invoke.getResult();
+                if(resultVar != null){
+                    CSVar resultPtr = csManager.getCSVar(ctxrecv, resultVar);
+                    for(Var returnVar : callee.getIR().getReturnVars()){
+                        CSVar returnPtr = csManager.getCSVar(ctx, returnVar);
+                        addPFGEdge(returnPtr, resultPtr);
+                    }
+                    if (taintAnalysis.captureTaintObj(targetMethod.getMethod(), callSite.getCallSite()) != null) {
+                        addTaintEntryToWorkList(resultPtr, taintAnalysis.captureTaintObj(targetMethod.getMethod(), callSite.getCallSite()));
+                    }
+                }
+            }
+        }
     }
 
     /**

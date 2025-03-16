@@ -24,8 +24,10 @@ package pascal.taie.analysis.dataflow.inter;
 
 import pascal.taie.analysis.dataflow.fact.DataflowResult;
 import pascal.taie.analysis.graph.icfg.ICFG;
+import pascal.taie.analysis.graph.icfg.ICFGEdge;
 import pascal.taie.util.collection.SetQueue;
 
+import java.util.ArrayDeque;
 import java.util.Queue;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -41,9 +43,9 @@ class InterSolver<Method, Node, Fact> {
 
     private final ICFG<Method, Node> icfg;
 
-    private DataflowResult<Node, Fact> result;
+    DataflowResult<Node, Fact> result;
 
-    private Queue<Node> workList;
+    Queue<Node> workList;
 
     InterSolver(InterDataflowAnalysis<Node, Fact> analysis,
                 ICFG<Method, Node> icfg) {
@@ -60,9 +62,39 @@ class InterSolver<Method, Node, Fact> {
 
     private void initialize() {
         // TODO - finish me
+        for (Node node : icfg) {
+            result.setInFact(node, analysis.newInitialFact());
+            result.setOutFact(node, analysis.newInitialFact());
+        }
+        icfg.entryMethods().toList().forEach(method -> {
+            Node entryOf = icfg.getEntryOf(method);
+            result.setOutFact(entryOf, analysis.newBoundaryFact(entryOf));
+            result.setInFact(entryOf, analysis.newBoundaryFact(entryOf));
+        });
+
     }
 
     private void doSolve() {
         // TODO - finish me
+        workList = new SetQueue<>();
+        workList.addAll(icfg.getNodes());
+        while (!workList.isEmpty()) {
+            Node node = workList.poll();
+            for (ICFGEdge<Node> nodeICFGEdge : icfg.getInEdgesOf(node)) {
+                Fact inFact = result.getInFact(nodeICFGEdge.getSource());
+                Fact outFact = result.getOutFact(nodeICFGEdge.getSource());
+                analysis.meetInto(analysis.transferEdge(nodeICFGEdge, outFact), result.getInFact(node));
+            }
+            Fact oldOutFact = result.getOutFact(node);
+            Fact oldinFact = result.getInFact(node);
+            if (analysis.transferNode(node, oldinFact, oldOutFact)) {
+                for (Node succ : icfg.getSuccsOf(node)) {
+                    if (!workList.contains(succ)) {
+                        workList.offer(succ);
+                    }
+                }
+            }
+        }
     }
 }
+

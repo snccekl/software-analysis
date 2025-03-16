@@ -33,21 +33,13 @@ import pascal.taie.analysis.graph.cfg.CFGBuilder;
 import pascal.taie.analysis.graph.cfg.Edge;
 import pascal.taie.config.AnalysisConfig;
 import pascal.taie.ir.IR;
-import pascal.taie.ir.exp.ArithmeticExp;
-import pascal.taie.ir.exp.ArrayAccess;
-import pascal.taie.ir.exp.CastExp;
-import pascal.taie.ir.exp.FieldAccess;
-import pascal.taie.ir.exp.NewExp;
-import pascal.taie.ir.exp.RValue;
-import pascal.taie.ir.exp.Var;
+import pascal.taie.ir.exp.*;
 import pascal.taie.ir.stmt.AssignStmt;
 import pascal.taie.ir.stmt.If;
 import pascal.taie.ir.stmt.Stmt;
 import pascal.taie.ir.stmt.SwitchStmt;
 
-import java.util.Comparator;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 
 public class DeadCodeDetection extends MethodAnalysis {
 
@@ -71,6 +63,62 @@ public class DeadCodeDetection extends MethodAnalysis {
         Set<Stmt> deadCode = new TreeSet<>(Comparator.comparing(Stmt::getIndex));
         // TODO - finish me
         // Your task is to recognize dead code in ir and add it to deadCode
+        Set<Stmt> reachable = new HashSet<>();
+        Deque<Stmt> stmts = new ArrayDeque<>();
+
+        reachable.add(cfg.getEntry());
+        stmts.add(cfg.getEntry());
+        while (!stmts.isEmpty()) {
+            Stmt stmt = stmts.poll();
+            reachable.add(stmt);
+            if (stmt instanceof AssignStmt assignStmt) {
+                SetFact<Var> liveVarsResult = liveVars.getResult(assignStmt);
+                LValue lhs = assignStmt.getLValue();
+                RValue rhs = assignStmt.getRValue();
+                if (lhs instanceof Var var && !liveVarsResult.contains(var) && hasNoSideEffect(rhs)) {
+                    deadCode.add(stmt);
+                }
+            }
+            if (stmt instanceof If ifStmt) {
+                CPFact fact = constants.getOutFact(stmt);
+                Value value = ConstantPropagation.evaluate(ifStmt.getCondition(), fact);
+                if (value.isConstant()) {
+                    Edge.Kind kind = value.getConstant() == 1 ? Edge.Kind.IF_TRUE : Edge.Kind.IF_FALSE;
+                    cfg.getOutEdgesOf(ifStmt).stream()
+                            .filter(edge -> edge.getKind() == kind)
+                            .map(Edge::getTarget)
+                            .forEach(stmts::add);
+                    continue;
+                }
+            }
+            if (stmt instanceof SwitchStmt switchStmt) {
+                Var var = switchStmt.getVar();
+                CPFact result = constants.getResult(switchStmt);
+                if (result.get(var).isConstant()) {
+                    int value = result.get(var).getConstant();
+                    boolean matched = cfg.getOutEdgesOf(switchStmt).stream()
+                            .filter(edge -> edge.getKind() == Edge.Kind.SWITCH_CASE && edge.getCaseValue() == value)
+                            .map(Edge::getTarget)
+                            .peek(stmts::add)
+                            .findAny()
+                            .isPresent();
+                    if (!matched) {
+                        cfg.getOutEdgesOf(switchStmt).stream()
+                                .filter(edge -> edge.getKind() == Edge.Kind.SWITCH_DEFAULT)
+                                .map(Edge::getTarget)
+                                .forEach(stmts::add);
+                    }
+                    continue;
+                }
+            }
+            cfg.getSuccsOf(stmt).stream()
+                    .filter(succ -> !reachable.contains(succ))
+                    .forEach(stmts::add);
+        }
+        ir.getStmts().stream()
+                .filter(stmt -> !reachable.contains(stmt))
+                .forEach(deadCode::add);
+
         return deadCode;
     }
 
